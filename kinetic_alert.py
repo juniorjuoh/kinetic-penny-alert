@@ -57,8 +57,11 @@ USE_FORMING_BAR = env("USE_FORMING_BAR", 1, int)  # 1 = alert intrabar (live), 0
 FLIP_LOOKBACK = env("FLIP_LOOKBACK_BARS", 2, int)  # also catch flips within the last N bars
 PREPOST = env("PREPOST", 1, int)                  # include pre/after-hours bars
 MOVER_ALERTS = env("MOVER_ALERTS", 1, int)        # alert when a penny stock first hits +MIN_CHANGE
+MIN_AVG_VOL = env("MIN_AVG_VOL", 200_000, int)    # pre/post-market universe: 3-month avg volume floor
+MIN_EXT_VOLUME = env("MIN_EXT_VOLUME", 50_000, int)  # pre-market volume floor (only if Yahoo reports it)
 MIN_BARS = 60
 PERIOD = "58d"  # Yahoo caps 30m data at 60 days
+QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
 
 # Kinetic Stocks Gaussian settings (same as the Pine defaults)
 G_LENGTH, G_POLES, G_SMOOTH, G_FLATTEN = 260, 2, 26, 10
@@ -208,6 +211,100 @@ def screen_movers():
     return out
 
 
+def market_phase():
+    """pre 04:00-09:30 ET, regular 09:30-16:00, post 16:00-20:00 (override with FORCE_PHASE for testing)."""
+    forced = os.environ.get("FORCE_PHASE")
+    if forced in ("pre", "regular", "post"):
+        return forced
+    t = datetime.now(ET)
+    m = t.hour * 60 + t.minute
+    return "pre" if m < 570 else ("regular" if m < 960 else "post")
+
+
+_universe = {"t": 0.0, "syms": []}
+
+
+def load_universe():
+    """Penny-ish US stocks with enough average volume; refreshed every 30 minutes."""
+    if _universe["syms"] and time.time() - _universe["t"] < 1800:
+        return _universe["syms"]
+    from yfinance import EquityQuery
+
+    conds = [
+        EquityQuery("eq", ["region", "us"]),
+        EquityQuery("lt", ["intradayprice", MAX_PRICE * 2]),  # a $2.5 stock can be a $5 stock by +100%
+        EquityQuery("gte", ["avgdailyvol3m", MIN_AVG_VOL]),
+    ]
+    if not INCLUDE_OTC:
+        conds.append(EquityQuery("is-in", ["exchange", "NMS", "NCM", "NGM", "NYQ", "ASE", "BTS"]))
+    q, syms = EquityQuery("and", conds), []
+    for off in range(0, 2000, 250):
+        res = yf.screen(q, offset=off, size=250, sortField="avgdailyvol3m", sortAsc=False)
+        rows = res.get("quotes", [])
+        syms += [r["symbol"] for r in rows if r.get("quoteType", "EQUITY") == "EQUITY"]
+        if len(rows) < 250:
+            break
+    _universe.update(t=time.time(), syms=syms)
+    log(f"universe refreshed: {len(syms)} symbols")
+    return syms
+
+
+_yf_data = None
+
+
+def batch_quotes(symbols):
+    global _yf_data
+    from yfinance.data import YfData
+
+    if _yf_data is None:
+        _yf_data = YfData()  # handles Yahoo cookie + crumb
+    out = []
+    for i in range(0, len(symbols), 150):
+        r = _yf_data.get(QUOTE_URL, params={"symbols": ",".join(symbols[i : i + 150]), "formatted": "false"})
+        out += r.json().get("quoteResponse", {}).get("result", [])
+    return out
+
+
+def extended_movers(phase):
+    """Pre-market / after-hours movers: % change vs the previous regular close."""
+    out = []
+    for q in batch_quotes(load_universe()):
+        sym = q.get("symbol", "")
+        if not sym or "-" in sym or "=" in sym or (len(sym) == 5 and sym[-1] in "WRU"):
+            continue
+        reg = q.get("regularMarketChangePercent") or 0.0
+        if phase == "pre":
+            price, chg, vol = q.get("preMarketPrice"), q.get("preMarketChangePercent"), q.get("preMarketVolume")
+            if vol is not None and vol < MIN_EXT_VOLUME:
+                continue
+        else:
+            price, post, vol = q.get("postMarketPrice"), q.get("postMarketChangePercent"), q.get("regularMarketVolume")
+            chg = ((1 + reg / 100) * (1 + post / 100) - 1) * 100 if post is not None else None
+            if vol is not None and vol < MIN_VOLUME:
+                continue
+        if price is None or chg is None or chg < MIN_CHANGE or price >= MAX_PRICE:
+            continue
+        out.append({"sym": sym, "name": q.get("shortName") or q.get("longName") or "", "price": price, "chg": chg, "vol": vol})
+    return out
+
+
+def find_movers():
+    """Regular hours: screener. Pre-market: extended quotes. After-hours: both, merged by symbol."""
+    phase = market_phase()
+    found = {}
+    if phase in ("regular", "post"):
+        for m in screen_movers():
+            found[m["sym"]] = m
+    if phase in ("pre", "post"):
+        try:
+            for m in extended_movers(phase):
+                if m["sym"] not in found or (m["chg"] or 0) > (found[m["sym"]]["chg"] or 0):
+                    found[m["sym"]] = m
+        except Exception as e:
+            log(f"extended movers failed: {e!r}")
+    return sorted(found.values(), key=lambda m: -(m["chg"] or 0))
+
+
 def fetch_bars(symbols, interval):
     out = {}
     for k in range(0, len(symbols), 40):
@@ -285,7 +382,7 @@ def minutes_to_open():
 # ---------------------------------------------------------------- one cycle
 def cycle(state):
     try:
-        movers = screen_movers()
+        movers = find_movers()
     except Exception as e:  # keep running on transient Yahoo errors
         log(f"screener failed: {e!r}")
         movers = []
