@@ -1,0 +1,64 @@
+name: kinetic-alert
+
+on:
+  schedule:
+    # ~5.5h jobs chained back to back to cover 04:00-20:00 ET (08:00-00:00 UTC in summer time)
+    - cron: "0 8 * * 1-5"
+    - cron: "30 13 * * 1-5"
+    - cron: "0 19 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      max_minutes:
+        description: "Run time in minutes (use 3 for a quick test)"
+        default: "330"
+      always:
+        description: "Run even when the US market is closed (for testing)"
+        type: boolean
+        default: false
+
+# one job at a time; a later trigger waits for the current one instead of cancelling it
+concurrency:
+  group: kinetic-alert
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 345
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      # carry the watchlist / already-sent keys from the previous job so alerts are not repeated
+      - uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: kinetic-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: kinetic-state-
+
+      - name: Run
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MIN_CHANGE_PCT: ${{ vars.MIN_CHANGE_PCT }}
+          MAX_PRICE: ${{ vars.MAX_PRICE }}
+          MIN_VOLUME: ${{ vars.MIN_VOLUME }}
+          INCLUDE_OTC: ${{ vars.INCLUDE_OTC }}
+          USE_FORMING_BAR: ${{ vars.USE_FORMING_BAR }}
+          MOVER_ALERTS: ${{ vars.MOVER_ALERTS }}
+        run: |
+          ARGS="--max-minutes ${{ inputs.max_minutes || 330 }} --exit-when-closed"
+          if [ "${{ inputs.always }}" = "true" ]; then ARGS="$ARGS --always"; fi
+          python kinetic_alert.py $ARGS
+
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: state.json
+          key: kinetic-state-${{ github.run_id }}-${{ github.run_attempt }}
