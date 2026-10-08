@@ -371,12 +371,12 @@ def session_open():
     return t.weekday() < 5 and 4 <= t.hour < 20
 
 
-def minutes_to_open():
-    """Minutes until today's 04:00 ET open on a weekday, or None if the open is not today."""
+def seconds_to_open():
+    """Seconds until today's 04:00 ET pre-market open on a weekday, or None if the open is not today."""
     t = datetime.now(ET)
     if t.weekday() >= 5 or t.hour >= 4:
         return None
-    return (4 - t.hour) * 60 - t.minute
+    return ((4 - t.hour) * 60 - t.minute) * 60 - t.second
 
 
 # ---------------------------------------------------------------- one cycle
@@ -499,11 +499,15 @@ def main():
                 return
             time.sleep(POLL)
         else:
-            wait = minutes_to_open()
-            if a.exit_when_closed and (wait is None or wait > 90):
+            wait = seconds_to_open()
+            # waiting up to 150 min lets a job that GitHub starts early be ready when the pre-market opens
+            # (the open is 08:00 UTC in summer time, 09:00 UTC in winter time)
+            if a.exit_when_closed and (wait is None or wait > 150 * 60):
                 return log("market closed - exiting")
-            log("market closed (04:00-20:00 ET, Mon-Fri) - sleeping 5 min")
-            time.sleep(300)
+            # sleep in 5-minute steps, but wake exactly at the open
+            nap = 300 if wait is None or wait > 300 else max(1, wait)
+            log(f"market closed (04:00-20:00 ET, Mon-Fri) - sleeping {nap}s")
+            time.sleep(nap)
     log("max runtime reached - exiting for handoff")
 
 
