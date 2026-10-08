@@ -2,10 +2,13 @@ name: kinetic-alert
 
 on:
   schedule:
-    # ~5.5h jobs chained back to back to cover 04:00-20:00 ET (08:00-00:00 UTC in summer time)
-    - cron: "0 8 * * 1-5"
-    - cron: "30 13 * * 1-5"
-    - cron: "0 19 * * 1-5"
+    # ~5.5h jobs chained back to back to cover 04:00-20:00 ET (08:00-00:00 UTC summer, 09:00-01:00 UTC winter).
+    # Off-peak minutes (not :00/:30, GitHub delays those a lot) and an early start: the script waits until the
+    # pre-market opens (up to 150 min ahead), so a late start of up to ~40 min still catches the open.
+    - cron: "17 7 * * 1-5"
+    - cron: "47 12 * * 1-5"
+    - cron: "47 17 * * 1-5"
+    - cron: "17 23 * * 1-5"      # winter-time tail (after-hours until 20:00 EST); exits at once in summer
   workflow_dispatch:
     inputs:
       max_minutes:
