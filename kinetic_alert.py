@@ -57,6 +57,9 @@ USE_FORMING_BAR = env("USE_FORMING_BAR", 1, int)  # 1 = alert intrabar (live), 0
 FLIP_LOOKBACK = env("FLIP_LOOKBACK_BARS", 2, int)  # also catch flips within the last N bars
 PREPOST = env("PREPOST", 1, int)                  # include pre/after-hours bars
 MOVER_ALERTS = env("MOVER_ALERTS", 1, int)        # alert when a penny stock first hits +MIN_CHANGE
+R2_ALERTS = env("R2_ALERTS", 1, int)              # alert when a watch-list stock trades above the 3-minute Pivot R2
+R2_MIN_RANGE_PCT = env("R2_MIN_RANGE_PCT", 0.5, float)  # skip if the previous 3m bar's (high-low)/close is below this %
+R2_MAX_AGE_SEC = env("R2_MAX_AGE_SEC", 240, int)  # the last trade must be this recent (no alert on a stale price)
 MIN_AVG_VOL = env("MIN_AVG_VOL", 200_000, int)    # pre/post-market universe: 3-month avg volume floor
 MIN_EXT_VOLUME = env("MIN_EXT_VOLUME", 50_000, int)  # pre-market volume floor (only if Yahoo reports it)
 MIN_BARS = 60
@@ -379,6 +382,104 @@ def seconds_to_open():
     return ((4 - t.hour) * 60 - t.minute) * 60 - t.second
 
 
+# ---------------------------------------------------------------- 3-minute Pivot R2
+def bars_3m(rows):
+    """1-minute rows [(ts, o, h, l, c, v)] (ascending, aware ET) -> 3-minute bars aligned to the clock (04:00, 04:03, ...).
+    A minute without trades has no row, so a bar is built only from minutes that exist (nothing is invented)."""
+    out = []
+    for ts, o, h, l, c, v in rows:
+        key = ts.replace(minute=ts.minute - ts.minute % 3, second=0, microsecond=0)
+        if out and out[-1]["t"] == key:
+            b = out[-1]
+            b["h"], b["l"], b["c"], b["v"] = max(b["h"], h), min(b["l"], l), c, b["v"] + v
+        else:
+            out.append({"t": key, "o": o, "h": h, "l": l, "c": c, "v": v})
+    return out
+
+
+def pivot_levels(h, l, c):
+    """Classic (Standard) pivot points from one bar's high / low / close."""
+    p = (h + l + c) / 3.0
+    return {"P": p, "R1": 2 * p - l, "R2": p + (h - l), "S1": 2 * p - h, "S2": p - (h - l)}
+
+
+def r2_state(rows, now):
+    """Latest price vs. R2 of the PREVIOUS (completed) 3-minute bar.  None = cannot be judged."""
+    if not rows:
+        return None
+    last = rows[-1]
+    if (now - last[0]).total_seconds() > R2_MAX_AGE_SEC:
+        return None                                   # no recent trade: never alert on a stale price
+    b3 = bars_3m(rows)
+    if len(b3) < 2 or b3[-2]["t"].date() != b3[-1]["t"].date():
+        return None
+    prev, cur = b3[-2], b3[-1]
+    if prev["c"] <= 0:
+        return None
+    range_pct = (prev["h"] - prev["l"]) / prev["c"] * 100.0
+    lv = pivot_levels(prev["h"], prev["l"], prev["c"])
+    price = last[4]
+    # a previous bar with (almost) no range puts R2 right on its high: any uptick would "break" it, so skip
+    return {"price": price, "price_ts": last[0], "levels": lv, "prev": prev, "cur_t": cur["t"], "range_pct": range_pct,
+            "above": range_pct >= R2_MIN_RANGE_PCT and price > lv["R2"]}
+
+
+def fmt_px(x):
+    return f"{x:.4f}" if x < 1 else f"{x:.2f}"
+
+
+def fetch_1m_rows(symbols):
+    out = {}
+    for k in range(0, len(symbols), 40):
+        chunk = symbols[k : k + 40]
+        raw = yf.download(chunk, period="1d", interval="1m", prepost=bool(PREPOST), group_by="ticker",
+                          auto_adjust=False, threads=False, progress=False)
+        if raw is None or raw.empty:
+            continue
+        frames = {}
+        if isinstance(raw.columns, pd.MultiIndex):
+            present = set(raw.columns.get_level_values(0))
+            frames = {s: raw[s] for s in chunk if s in present}
+        else:
+            frames = {chunk[0]: raw}
+        for s, d in frames.items():
+            d = d.dropna(subset=["Close"])
+            if len(d):
+                out[s] = [(ts.tz_convert(ET).to_pydatetime(), float(o), float(h), float(l), float(c), float(v) if v == v else 0.0)
+                          for ts, o, h, l, c, v in zip(d.index, d["Open"], d["High"], d["Low"], d["Close"], d["Volume"])]
+    return out
+
+
+def r2_message(sym, info, st):
+    lv, prev = st["levels"], st["prev"]
+    chg = info.get("chg")
+    head = f"🔥 <b>{sym}</b> 3분봉 Pivot R2 돌파" + (f" (당일 +{chg:.1f}%)" if chg is not None else "")
+    return (f"{head}\n"
+            f"현재가 <b>${fmt_px(st['price'])}</b> > R2 <b>${fmt_px(lv['R2'])}</b>  (마지막 체결 {st['price_ts']:%H:%M:%S} ET)\n"
+            f"기준: 직전 3분봉 {prev['t']:%H:%M} · H {fmt_px(prev['h'])} L {fmt_px(prev['l'])} C {fmt_px(prev['c'])}\n"
+            f"P {fmt_px(lv['P'])} | R1 {fmt_px(lv['R1'])} | R2 {fmt_px(lv['R2'])} | S1 {fmt_px(lv['S1'])}\n"
+            f"{info.get('name', '')}\n{link(sym)}")
+
+
+def check_r2(state):
+    """Watch-list stocks (already up >= MIN_CHANGE): alert once per day when the last price is above R2."""
+    watch = state["watch"]
+    sent = state.setdefault("r2_sent", [])
+    syms = [s for s in watch if s not in sent]
+    if not syms:
+        return
+    now = datetime.now(ET)
+    rows = fetch_1m_rows(syms)
+    n_above = 0
+    for s in syms:
+        st = r2_state(rows.get(s), now)
+        if st and st["above"]:
+            n_above += 1
+            sent.append(s)                      # recorded first: a send problem must not cause a repeat storm
+            send(r2_message(s, watch[s], st))
+    log(f"r2 check: {len(syms)} symbols, 1m data for {len(rows)}, above R2: {n_above}")
+
+
 # ---------------------------------------------------------------- one cycle
 def cycle(state):
     try:
@@ -403,6 +504,11 @@ def cycle(state):
             rows = "\n".join(f"• <b>{m['sym']}</b> +{m['chg']:.1f}% ${m['price']:.2f} ({fmt_vol(m['vol'])})" for m in fresh)
             send(f"🚀 페니 +{MIN_CHANGE:.0f}% 신규 {len(fresh)}종목\n{rows}")
     log(f"movers={len(movers)} new={len(fresh)} watchlist={len(watch)}")
+    if R2_ALERTS and watch:
+        try:
+            check_r2(state)
+        except Exception as e:                  # never let the R2 check stop the main alerts
+            log(f"r2 check failed: {e!r}")
     if not watch:
         return
 
