@@ -9,6 +9,7 @@ Run:   python kinetic_alert.py            (loop)
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime
@@ -60,6 +61,10 @@ MOVER_ALERTS = env("MOVER_ALERTS", 1, int)        # alert when a penny stock fir
 R2_ALERTS = env("R2_ALERTS", 1, int)              # alert when a watch-list stock trades above the 3-minute Pivot R2
 R2_MIN_RANGE_PCT = env("R2_MIN_RANGE_PCT", 0.5, float)  # skip if the previous 3m bar's (high-low)/close is below this %
 R2_MAX_AGE_SEC = env("R2_MAX_AGE_SEC", 240, int)  # the last trade must be this recent (no alert on a stale price)
+CUSTOM_ALERTS = env("CUSTOM_ALERTS", 1, int)      # tickers you type in Telegram -> alert when price goes above the 3m "5H"
+CUSTOM_COOLDOWN_SEC = env("CUSTOM_COOLDOWN_SEC", 300, int)   # min seconds between two alerts for the same ticker
+CUSTOM_MAX = env("CUSTOM_MAX", 30, int)           # max tickers you can watch at once
+CUSTOM_MSG_MAX_AGE_SEC = env("CUSTOM_MSG_MAX_AGE_SEC", 10800, int)  # ignore chat messages older than this (3 h)
 MIN_AVG_VOL = env("MIN_AVG_VOL", 200_000, int)    # pre/post-market universe: 3-month avg volume floor
 MIN_EXT_VOLUME = env("MIN_EXT_VOLUME", 50_000, int)  # pre-market volume floor (only if Yahoo reports it)
 MIN_BARS = 60
@@ -355,14 +360,17 @@ def link(sym):
 # ---------------------------------------------------------------- state
 def load_state():
     today = datetime.now(ET).strftime("%Y-%m-%d")
+    carry = {}
     if STATE_FILE.exists():
         try:
             s = json.loads(STATE_FILE.read_text(encoding="utf-8"))
             if s.get("date") == today:
                 return s
+            # a new day resets the movers watch-list, but your own tickers and the Telegram read position carry over
+            carry = {k: s[k] for k in ("custom", "tg_offset") if k in s}
         except Exception:
             pass
-    return {"date": today, "watch": {}, "sent": []}
+    return {"date": today, "watch": {}, "sent": [], **carry}
 
 
 def save_state(s):
@@ -480,6 +488,190 @@ def check_r2(state):
     log(f"r2 check: {len(syms)} symbols, 1m data for {len(rows)}, above R2: {n_above}")
 
 
+# ---------------------------------------------------------------- your own tickers (typed in Telegram) -> 3m "5H" breakout
+TICKER_RE = re.compile(r"^\$?([A-Za-z]{1,5}(?:[.\-][A-Za-z]{1,2})?)$")
+REMOVE_WORDS = {"삭제", "제거", "remove", "del", "delete", "rm"}
+LIST_WORDS = {"목록", "리스트", "list", "상태"}
+HELP_WORDS = {"도움말", "help", "?"}
+IGNORE_WORDS = {"hi", "hello", "hey", "ok", "okay", "yes", "no", "go", "thx", "thanks", "test", "start", "stop", "시작", "중지"}
+HELP_TEXT = ("사용법\n• 티커를 보내면 감시 시작 (여러 개는 띄어쓰기): GYGY ABCD\n• 삭제 GYGY\n• 목록\n"
+             "3분봉 '5H'(직전 완성된 3분봉 5개의 최고 고가) 위로 올라오면 알려 드립니다.")
+
+
+def parse_command(text):
+    """Telegram text -> ('add'|'remove'|'list'|'help', [tickers]) or None when it is not a command."""
+    t = (text or "").strip()
+    if not t or len(t) > 80:
+        return None
+    parts = [p for p in re.split(r"[\s,;]+", t) if p]
+    if not parts:
+        return None
+    head = parts[0].lower()
+    if head in HELP_WORDS and len(parts) == 1:
+        return ("help", [])
+    if head in LIST_WORDS and len(parts) == 1:
+        return ("list", [])
+    if head in REMOVE_WORDS:
+        syms = [m.group(1).upper() for p in parts[1:] if (m := TICKER_RE.match(p))]
+        return ("remove", syms) if syms and len(syms) == len(parts) - 1 else None
+    if len(parts) > 15 or any(p.lower() in IGNORE_WORDS for p in parts):
+        return None
+    syms = []
+    for p in parts:
+        m = TICKER_RE.match(p)
+        if not m:
+            return None
+        syms.append(m.group(1).upper())
+    return ("add", syms)
+
+
+def five_high_state(rows, now, n=5):
+    """Last price vs. the 3-minute 'nH': the highest HIGH of the previous n COMPLETED 3-minute bars.
+    The bar that is still forming is excluded, otherwise the price could never be above its own high."""
+    if not rows:
+        return None
+    last = rows[-1]
+    out = {"price": last[4], "price_ts": last[0], "stale": (now - last[0]).total_seconds() > R2_MAX_AGE_SEC,
+           "level": None, "above": None, "span": None}
+    b3 = bars_3m(rows)
+    recent = b3[-(n + 1):]
+    if len(recent) < n + 1 or any(b["t"].date() != recent[-1]["t"].date() for b in recent):
+        return out                                    # not enough completed bars yet today
+    done = recent[:-1]
+    out["level"] = max(b["h"] for b in done)
+    out["above"] = last[4] > out["level"]
+    out["span"] = (done[0]["t"], done[-1]["t"])
+    return out
+
+
+def symbol_exists(sym):
+    try:
+        return len(yf.Ticker(sym).history(period="5d")) > 0
+    except Exception:
+        return False
+
+
+def tg_get_updates(offset):
+    params = {"timeout": 0, "allowed_updates": json.dumps(["message"])}
+    if offset:
+        params["offset"] = offset
+    try:
+        r = requests.get(f"https://api.telegram.org/bot{TG_TOKEN}/getUpdates", params=params, timeout=15)
+    except requests.RequestException as e:
+        log(f"telegram getUpdates failed: {type(e).__name__}")     # no URL: it contains the bot token
+        return None
+    if r.status_code == 409:
+        log("telegram getUpdates 409 (a webhook is set?) - ticker commands are off")
+        return None
+    if not r.ok:
+        log(f"telegram getUpdates HTTP {r.status_code}")
+        return None
+    return r.json().get("result", [])
+
+
+def add_custom(state, sym):
+    custom = state.setdefault("custom", {})
+    if sym in custom:
+        send(f"ℹ️ <b>{sym}</b> 이미 감시 중입니다.")
+        return
+    if len(custom) >= CUSTOM_MAX:
+        send(f"⚠️ 감시 종목이 {CUSTOM_MAX}개라 더 추가할 수 없습니다. '삭제 티커'로 정리해 주세요.")
+        return
+    now = datetime.now(ET)
+    rows = fetch_1m_rows([sym]).get(sym)
+    if not rows:
+        if not symbol_exists(sym):
+            send(f"❌ <b>{sym}</b>: 종목을 찾을 수 없습니다. 티커를 확인해 주세요.")
+            return
+        custom[sym] = {"added": now.isoformat(), "above": None, "last_alert": None}
+        send(f"✅ <b>{sym}</b> 감시 시작 (오늘 거래 데이터가 아직 없어서 거래가 생기면 판정합니다)")
+        return
+    st = five_high_state(rows, now)
+    custom[sym] = {"added": now.isoformat(), "above": st["above"] if st and not st["stale"] else None, "last_alert": None}
+    if st["level"] is None:
+        send(f"✅ <b>{sym}</b> 감시 시작 · 현재가 ${fmt_px(st['price'])} (완성된 3분봉이 5개 미만이라 5H 계산 대기)")
+        return
+    pos = "5H <b>위</b>" if st["above"] else "5H 아래"
+    note = "  ※ 마지막 체결이 오래됨" if st["stale"] else ""
+    extra = "\n이미 위에 있어서, 아래로 내려갔다가 다시 올라올 때 알려 드립니다." if st["above"] else ""
+    send(f"✅ <b>{sym}</b> 감시 시작 · 현재가 ${fmt_px(st['price'])} · 3분봉 5H ${fmt_px(st['level'])} → {pos}{note}{extra}")
+
+
+def handle_command(state, cmd):
+    kind, syms = cmd
+    custom = state.setdefault("custom", {})
+    if kind == "help":
+        send(HELP_TEXT)
+    elif kind == "list":
+        if not custom:
+            send("감시 중인 종목이 없습니다. 티커를 보내 주세요. (예: GYGY)")
+            return
+        rows = fetch_1m_rows(list(custom))
+        now = datetime.now(ET)
+        lines = []
+        for s in custom:
+            st = five_high_state(rows.get(s), now)
+            if not st or st["level"] is None:
+                lines.append(f"• {s}: 5H 계산 대기")
+            else:
+                lines.append(f"• {s}: ${fmt_px(st['price'])} / 5H ${fmt_px(st['level'])} → {'위' if st['above'] else '아래'}")
+        send("📋 감시 목록\n" + "\n".join(lines))
+    elif kind == "remove":
+        gone = [s for s in syms if custom.pop(s, None) is not None]
+        miss = [s for s in syms if s not in gone]
+        send((f"🗑 삭제: {', '.join(gone)}" if gone else "") + (("\n" if gone else "") + f"목록에 없음: {', '.join(miss)}" if miss else ""))
+    elif kind == "add":
+        for s in syms:
+            add_custom(state, s)
+
+
+def process_telegram(state):
+    """Read new messages from YOUR chat only and run add / remove / list commands."""
+    if not TG_TOKEN or not TG_CHAT:
+        return
+    updates = tg_get_updates(state.get("tg_offset") or None)
+    if not updates:
+        return
+    now_ts = time.time()
+    for u in updates:
+        state["tg_offset"] = u["update_id"] + 1
+        m = u.get("message") or {}
+        if str((m.get("chat") or {}).get("id")) != str(TG_CHAT):
+            continue                                  # anyone else who finds the bot is ignored
+        if (m.get("from") or {}).get("is_bot") or now_ts - m.get("date", 0) > CUSTOM_MSG_MAX_AGE_SEC:
+            continue
+        cmd = parse_command(m.get("text"))
+        if cmd:
+            try:
+                handle_command(state, cmd)
+            except Exception as e:                    # one bad command must not stop the others
+                log(f"command failed: {e!r}")
+
+
+def check_custom(state):
+    """Alert when a ticker you added goes from BELOW to ABOVE its 3-minute 5H."""
+    custom = state.get("custom") or {}
+    if not custom:
+        return
+    now = datetime.now(ET)
+    rows = fetch_1m_rows(list(custom))
+    n_alert = 0
+    for sym, ent in custom.items():
+        st = five_high_state(rows.get(sym), now)
+        if not st or st["level"] is None or st["stale"]:
+            continue                                  # cannot judge: keep the previous state
+        if ent.get("above") is False and st["above"]:
+            last = ent.get("last_alert")
+            if not last or (now - datetime.fromisoformat(last)).total_seconds() >= CUSTOM_COOLDOWN_SEC:
+                a, b = st["span"]
+                send(f"🔼 <b>{sym}</b> 3분봉 5H 돌파\n현재가 <b>${fmt_px(st['price'])}</b> > 5H <b>${fmt_px(st['level'])}</b>  "
+                     f"(마지막 체결 {st['price_ts']:%H:%M:%S} ET)\n기준: 직전 완성된 3분봉 5개({a:%H:%M}~{b:%H:%M})의 최고 고가\n{link(sym)}")
+                ent["last_alert"] = now.isoformat()
+                n_alert += 1
+        ent["above"] = st["above"]
+    log(f"custom check: {len(custom)} tickers, 1m data for {len(rows)}, alerts: {n_alert}")
+
+
 # ---------------------------------------------------------------- one cycle
 def cycle(state):
     try:
@@ -504,6 +696,12 @@ def cycle(state):
             rows = "\n".join(f"• <b>{m['sym']}</b> +{m['chg']:.1f}% ${m['price']:.2f} ({fmt_vol(m['vol'])})" for m in fresh)
             send(f"🚀 페니 +{MIN_CHANGE:.0f}% 신규 {len(fresh)}종목\n{rows}")
     log(f"movers={len(movers)} new={len(fresh)} watchlist={len(watch)}")
+    if CUSTOM_ALERTS:
+        try:
+            process_telegram(state)
+            check_custom(state)
+        except Exception as e:                  # never let this stop the main alerts
+            log(f"custom watch failed: {e!r}")
     if R2_ALERTS and watch:
         try:
             check_r2(state)
