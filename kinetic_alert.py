@@ -65,12 +65,9 @@ CUSTOM_ALERTS = env("CUSTOM_ALERTS", 1, int)      # tickers you type in Telegram
 CUSTOM_COOLDOWN_SEC = env("CUSTOM_COOLDOWN_SEC", 300, int)   # min seconds between two alerts for the same ticker
 CUSTOM_MAX = env("CUSTOM_MAX", 30, int)           # max tickers you can watch at once
 CUSTOM_MSG_MAX_AGE_SEC = env("CUSTOM_MSG_MAX_AGE_SEC", 10800, int)  # ignore chat messages older than this (3 h)
-PICK_ALERTS = env("PICK_ALERTS", 0, int)          # recommend stocks up >= PICK_MIN_CHANGE whose 3m and 10m Pivots are similar
-PICK_MIN_CHANGE = env("PICK_MIN_CHANGE", 16.0, float)   # day % change for a recommendation candidate
-PICK_SIM_PCT = env("PICK_SIM_PCT", 0.5, float)    # "similar" = P and R1 of the 3m / 10m Pivots differ by at most this % of the price
-PICK_MAX = env("PICK_MAX", 40, int)               # max recommended stocks tracked per day
-PICK_COOLDOWN_SEC = env("PICK_COOLDOWN_SEC", 600, int)  # min seconds between two entry alerts for the same stock
-PICK_MAX_ENTRIES = env("PICK_MAX_ENTRIES", 3, int)      # max entry alerts per stock per day (R1 is crossed 10-80 times a day)
+PDH_ALERTS = env("PDH_ALERTS", 1, int)            # alert: up >= PDH_MIN_CHANGE, price above yesterday's high, yesterday's Pivot near that high
+PDH_MIN_CHANGE = env("PDH_MIN_CHANGE", 16.0, float)   # day % change for the candidate list
+PDH_PIVOT_NEAR_PCT = env("PDH_PIVOT_NEAR_PCT", 5.0, float)  # "near" = yesterday's Pivot is within this % of yesterday's high
 MIN_AVG_VOL = env("MIN_AVG_VOL", 200_000, int)    # pre/post-market universe: 3-month avg volume floor
 MIN_EXT_VOLUME = env("MIN_EXT_VOLUME", 50_000, int)  # pre-market volume floor (only if Yahoo reports it)
 MIN_BARS = 60
@@ -499,98 +496,84 @@ def check_r2(state):
     log(f"r2 check: {len(syms)} symbols, 1m data for {len(rows)}, above R2: {n_above}")
 
 
-# ---------------------------------------------------------------- recommendations: 3m Pivot ~ 10m Pivot on a +16% stock, entry on R1
-def pivot_pair(rows, now):
-    """Latest price vs. the Pivots of the previous completed 3-minute AND 10-minute bars.  None = cannot be judged.
-    similar = P and R1 of the two timeframes lie within PICK_SIM_PCT % of the price;  above_r1 = price > the 3m R1."""
-    if not rows:
+# ---------------------------------------------------------------- previous-day-high breakout (+16%) with the Pivot near it
+def fetch_prev_day_levels(symbols):
+    """Previous trading day's high / low / close (pre- and after-hours included) and its Classic Pivot levels, from 5 days of 1-minute bars."""
+    out = {}
+    today = datetime.now(ET).date()
+    for k in range(0, len(symbols), 40):
+        chunk = symbols[k : k + 40]
+        raw = yf.download(chunk, period="5d", interval="1m", prepost=bool(PREPOST), group_by="ticker",
+                          auto_adjust=False, threads=False, progress=False)
+        if raw is None or raw.empty:
+            continue
+        if isinstance(raw.columns, pd.MultiIndex):
+            present = set(raw.columns.get_level_values(0))
+            frames = {s: raw[s] for s in chunk if s in present}
+        else:
+            frames = {chunk[0]: raw}
+        for s, d in frames.items():
+            d = d.dropna(subset=["Close"])
+            if d.empty:
+                continue
+            d = d.copy()
+            d.index = d.index.tz_convert(ET)
+            prev_days = sorted({ts.date() for ts in d.index if ts.date() < today})
+            if not prev_days:
+                continue
+            x = d[[ts.date() == prev_days[-1] for ts in d.index]]
+            h, l, c = float(x["High"].max()), float(x["Low"].min()), float(x["Close"].iloc[-1])
+            if h > 0:
+                out[s] = {"date": prev_days[-1].isoformat(), "h": h, "l": l, "c": c, **pivot_levels(h, l, c)}
+    return out
+
+
+def pdh_state(rows, lv, now):
+    """Latest price vs. yesterday's high; is yesterday's Pivot near that high.  None = cannot be judged (no / stale price)."""
+    if not rows or not lv:
         return None
     last = rows[-1]
-    if (now - last[0]).total_seconds() > R2_MAX_AGE_SEC:
-        return None                                   # stale price: never judge it
-    b3, b10 = bars_nm(rows, 3), bars_nm(rows, 10)
-    if len(b3) < 2 or len(b10) < 2:
+    if (now - last[0]).total_seconds() > R2_MAX_AGE_SEC or last[0].date() != now.date():
         return None
-    if b3[-2]["t"].date() != b3[-1]["t"].date() or b10[-2]["t"].date() != b10[-1]["t"].date():
-        return None
-    p3, p10 = b3[-2], b10[-2]
-    price = last[4]
-    if price <= 0 or p3["c"] <= 0 or p10["c"] <= 0:
-        return None
-    range3 = (p3["h"] - p3["l"]) / p3["c"] * 100.0
-    lv3, lv10 = pivot_levels(p3["h"], p3["l"], p3["c"]), pivot_levels(p10["h"], p10["l"], p10["c"])
-    diff = max(abs(lv3["P"] - lv10["P"]), abs(lv3["R1"] - lv10["R1"])) / price * 100.0
-    # a 3m bar with (almost) no range puts P, R1 and its high on the same spot: any uptick would "break" R1, so no verdict
-    ok = range3 >= R2_MIN_RANGE_PCT
-    return {"price": price, "price_ts": last[0], "lv3": lv3, "lv10": lv10, "prev3": p3, "prev10": p10,
-            "diff_pct": diff, "similar": ok and diff <= PICK_SIM_PCT, "above_r1": ok and price > lv3["R1"]}
+    near_pct = abs(lv["P"] - lv["h"]) / lv["h"] * 100.0
+    return {"price": last[4], "price_ts": last[0], "above": last[4] > lv["h"], "near_pct": near_pct,
+            "near": near_pct <= PDH_PIVOT_NEAR_PCT}
 
 
-def _pivot_lines(st):
-    a, b = st["lv3"], st["lv10"]
-    return (f"3분 Pivot  P {fmt_px(a['P'])} | R1 {fmt_px(a['R1'])} | R2 {fmt_px(a['R2'])}  (기준 {st['prev3']['t']:%H:%M})\n"
-            f"10분 Pivot P {fmt_px(b['P'])} | R1 {fmt_px(b['R1'])} | R2 {fmt_px(b['R2'])}  (기준 {st['prev10']['t']:%H:%M})\n"
-            f"두 Pivot 차이 {st['diff_pct']:.2f}% (기준 ≤ {PICK_SIM_PCT:.1f}%)")
-
-
-def pick_message(sym, info, st):
+def pdh_message(sym, info, lv, st):
     chg = f"+{info['chg']:.1f}%" if info.get("chg") is not None else "-"
-    state = "이미 R1 위 (R1 아래로 내려갔다가 다시 돌파하면 진입 알림)" if st["above_r1"] else f"R1 ${fmt_px(st['lv3']['R1'])} 돌파 시 진입 알림"
-    return (f"🎯 <b>{sym}</b> 추천 · 당일 {chg} · ${fmt_px(st['price'])}\n"
-            f"{_pivot_lines(st)}\n"
-            f"진입: {state}\n{info.get('name', '')}\n{link(sym)}")
+    return (f"📈 <b>{sym}</b> 전일고가 돌파 · 당일 {chg} · ${fmt_px(st['price'])}\n"
+            f"전일고가 <b>${fmt_px(lv['h'])}</b> ({lv['date']}) 위 · 마지막 체결 {st['price_ts']:%H:%M:%S} ET\n"
+            f"전일 Pivot <b>${fmt_px(lv['P'])}</b> (전일고가와 {st['near_pct']:.1f}% 차이)\n"
+            f"R1 {fmt_px(lv['R1'])} | R2 {fmt_px(lv['R2'])} | S1 {fmt_px(lv['S1'])}  (전일 고·저·종가 기준 계산값)\n"
+            f"{info.get('name', '')}\n{link(sym)}")
 
 
-def entry_message(sym, info, st):
-    chg = f"+{info['chg']:.1f}%" if info.get("chg") is not None else "-"
-    return (f"✅ <b>{sym}</b> 진입 · 3분봉 R1 돌파 (당일 {chg})\n"
-            f"현재가 <b>${fmt_px(st['price'])}</b> > R1 <b>${fmt_px(st['lv3']['R1'])}</b>  (마지막 체결 {st['price_ts']:%H:%M:%S} ET)\n"
-            f"{_pivot_lines(st)}\n{link(sym)}")
-
-
-def check_picks(state, movers_all):
-    """Candidates = penny movers up >= PICK_MIN_CHANGE.  A candidate whose 3m and 10m Pivots are similar is recommended once a day;
-    after that, an alert fires each time the price crosses from below to above the 3m R1 (the entry)."""
-    picks = state.setdefault("picks", {})
+def check_pdh(state, movers_all):
+    """Candidates = penny movers up >= PDH_MIN_CHANGE.  Alert once per day when the price is above yesterday's high
+    AND yesterday's Pivot is within PDH_PIVOT_NEAR_PCT % of that high."""
+    sent = state.setdefault("pdh_sent", [])
+    levels = state.setdefault("pdh_levels", {})
     now = datetime.now(ET)
-    chg_now = {m["sym"]: m for m in movers_all}
-    cands = [m for m in movers_all if m["sym"] not in picks and (m.get("chg") or 0) >= PICK_MIN_CHANGE]
-    syms = [m["sym"] for m in cands] + list(picks)
-    if not syms:
+    cands = [m for m in movers_all if m["sym"] not in sent and (m.get("chg") or 0) >= PDH_MIN_CHANGE]
+    if not cands:
         return
-    rows = fetch_1m_rows(syms)
-    n_new = n_entry = 0
-    added = set()
+    need = [m["sym"] for m in cands if m["sym"] not in levels]
+    if need:
+        levels.update(fetch_prev_day_levels(need))
+        for s in need:
+            levels.setdefault(s, None)                  # no data: do not refetch every minute
+    syms = [m["sym"] for m in cands if levels.get(m["sym"])]
+    rows = fetch_1m_rows(syms) if syms else {}
+    n_hit = 0
     for m in cands:
-        if len(picks) >= PICK_MAX:
-            break
-        st = pivot_pair(rows.get(m["sym"]), now)
-        if st and st["similar"]:
-            picks[m["sym"]] = {"name": m.get("name", ""), "chg": m.get("chg"), "above": st["above_r1"], "last_entry": None,
-                               "rec_at": now.isoformat()}
-            added.add(m["sym"])
-            n_new += 1
-            send(pick_message(m["sym"], picks[m["sym"]], st))
-    for s, info in list(picks.items()):
-        if s in chg_now:
-            info["chg"] = chg_now[s].get("chg")
-        if s in added:                          # just recommended this cycle: its state is already recorded
-            continue
-        st = pivot_pair(rows.get(s), now)
-        if not st:
-            continue
-        was, info["above"] = info.get("above"), st["above_r1"]
-        if st["above_r1"] and was is False:
-            last = info.get("last_entry")
-            if last and (now - datetime.fromisoformat(last)).total_seconds() < PICK_COOLDOWN_SEC:
-                continue
-            if info.get("entries", 0) >= PICK_MAX_ENTRIES:
-                continue
-            info["last_entry"] = now.isoformat()
-            info["entries"] = info.get("entries", 0) + 1
-            n_entry += 1
-            send(entry_message(s, info, st))
-    log(f"picks: candidates {len(cands)}, tracked {len(picks)}, new {n_new}, entry alerts {n_entry}")
+        lv = levels.get(m["sym"])
+        st = pdh_state(rows.get(m["sym"]), lv, now)
+        if st and st["above"] and st["near"]:
+            sent.append(m["sym"])                       # recorded first: a send problem must not cause a repeat storm
+            n_hit += 1
+            send(pdh_message(m["sym"], m, lv, st))
+    log(f"pdh check: candidates {len(cands)}, with levels {len(syms)}, alerts {n_hit}")
 
 
 # ---------------------------------------------------------------- your own tickers (typed in Telegram) -> 3m "5H" breakout
@@ -780,7 +763,7 @@ def check_custom(state):
 # ---------------------------------------------------------------- one cycle
 def cycle(state):
     try:
-        movers_all = find_movers(min(MIN_CHANGE, PICK_MIN_CHANGE) if PICK_ALERTS else None)
+        movers_all = find_movers(min(MIN_CHANGE, PDH_MIN_CHANGE) if PDH_ALERTS else None)
     except Exception as e:  # keep running on transient Yahoo errors
         log(f"screener failed: {e!r}")
         movers_all = []
@@ -813,11 +796,11 @@ def cycle(state):
             check_r2(state)
         except Exception as e:                  # never let the R2 check stop the main alerts
             log(f"r2 check failed: {e!r}")
-    if PICK_ALERTS:
+    if PDH_ALERTS:
         try:
-            check_picks(state, movers_all)
-        except Exception as e:                  # never let the recommendations stop the main alerts
-            log(f"picks check failed: {e!r}")
+            check_pdh(state, movers_all)
+        except Exception as e:                  # never let this check stop the main alerts
+            log(f"pdh check failed: {e!r}")
     if not watch:
         return
 
