@@ -54,7 +54,12 @@ jobs:
           MIN_VOLUME: ${{ vars.MIN_VOLUME }}
           INCLUDE_OTC: ${{ vars.INCLUDE_OTC }}
           USE_FORMING_BAR: ${{ vars.USE_FORMING_BAR }}
-          MOVER_ALERTS: ${{ vars.MOVER_ALERTS }}
+          # paused on 2026-11-20: only the previous-day-high alert (PDH_ALERTS) is on. To bring one back, change its "0" to "1".
+          PDH_ALERTS: "1"
+          MOVER_ALERTS: "0"
+          KINETIC_ALERTS: "0"
+          R2_ALERTS: "0"
+          CUSTOM_ALERTS: "0"
         run: |
           ARGS="--max-minutes ${{ inputs.max_minutes || 330 }} --exit-when-closed"
           if [ "${{ inputs.always }}" = "true" ]; then ARGS="$ARGS --always"; fi
