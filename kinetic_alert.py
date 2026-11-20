@@ -58,7 +58,8 @@ USE_FORMING_BAR = env("USE_FORMING_BAR", 1, int)  # 1 = alert intrabar (live), 0
 FLIP_LOOKBACK = env("FLIP_LOOKBACK_BARS", 2, int)  # also catch flips within the last N bars
 PREPOST = env("PREPOST", 1, int)                  # include pre/after-hours bars
 MOVER_ALERTS = env("MOVER_ALERTS", 1, int)        # alert when a penny stock first hits +MIN_CHANGE
-R2_ALERTS = env("R2_ALERTS", 1, int)              # alert when a watch-list stock trades above the 3-minute Pivot R2
+KINETIC_ALERTS = env("KINETIC_ALERTS", 1, int)    # Kinetic Gaussian red->green flips (30m / 1h) for the watch-list stocks
+R2_ALERTS = env("R2_ALERTS", 1, int)            # alert when a watch-list stock trades above the 3-minute Pivot R2
 R2_MIN_RANGE_PCT = env("R2_MIN_RANGE_PCT", 0.5, float)  # skip if the previous 3m bar's (high-low)/close is below this %
 R2_MAX_AGE_SEC = env("R2_MAX_AGE_SEC", 240, int)  # the last trade must be this recent (no alert on a stale price)
 CUSTOM_ALERTS = env("CUSTOM_ALERTS", 1, int)      # tickers you type in Telegram -> alert when price goes above the 3m "5H"
@@ -797,7 +798,7 @@ def cycle(state):
             check_pdh(state, movers_all)
         except Exception as e:                  # never let this check stop the main alerts
             log(f"pdh check failed: {e!r}")
-    if not watch:
+    if not watch or not KINETIC_ALERTS:
         return
 
     syms = list(watch)
