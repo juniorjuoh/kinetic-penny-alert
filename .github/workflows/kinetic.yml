@@ -2,9 +2,10 @@ name: kinetic-alert
 
 on:
   schedule:
-    # ~5.5h jobs chained back to back to cover 04:00-20:00 ET (08:00-00:00 UTC summer, 09:00-01:00 UTC winter).
-    # Off-peak minutes (not :00/:30, GitHub delays those a lot) and an early start: the script waits until the
-    # pre-market opens (up to 150 min ahead), so a late start of up to ~40 min still catches the open.
+    # Safety starters only: a day is three jobs that start each other (pre-market -> 09:20 ET, regular -> 14:30 ET,
+    # after-hours -> 20:00 ET).  A job started here picks the right phase by itself (--until-et auto), and if a job is
+    # already running this one just waits in the queue and replaces whatever was waiting.
+    # Off-peak minutes (not :00/:30, GitHub delays those a lot); the script waits for the pre-market open (up to 150 min ahead).
     - cron: "17 7 * * 1-5"
     - cron: "47 12 * * 1-5"
     - cron: "47 17 * * 1-5"
@@ -12,8 +13,11 @@ on:
   workflow_dispatch:
     inputs:
       max_minutes:
-        description: "Run time in minutes (use 3 for a quick test)"
-        default: "330"
+        description: "Max run time in minutes (GitHub stops a job at 360; use 3 for a quick test)"
+        default: "350"
+      until_et:
+        description: "Stop at this ET time HH:MM (empty = end of the current phase: 09:20 / 14:30 / 20:00)"
+        default: ""
       always:
         description: "Run even when the US market is closed (for testing)"
         type: boolean
@@ -24,10 +28,15 @@ concurrency:
   group: kinetic-alert
   cancel-in-progress: false
 
+# the last step starts the next phase's job with the workflow's own token
+permissions:
+  contents: read
+  actions: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 345
+    timeout-minutes: 358      # 350 min of bot + a few minutes of setup, below GitHub's 360-minute job limit
     steps:
       - uses: actions/checkout@v4
 
@@ -46,7 +55,9 @@ jobs:
           restore-keys: kinetic-state-
 
       - name: Run
+        id: run
         env:
+          UNTIL_ET: ${{ inputs.until_et }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MIN_CHANGE_PCT: ${{ vars.MIN_CHANGE_PCT }}
@@ -61,7 +72,7 @@ jobs:
           R2_ALERTS: "0"
           CUSTOM_ALERTS: "0"
         run: |
-          ARGS="--max-minutes ${{ inputs.max_minutes || 330 }} --exit-when-closed"
+          ARGS="--max-minutes ${{ inputs.max_minutes || 350 }} --exit-when-closed --until-et ${UNTIL_ET:-auto}"
           if [ "${{ inputs.always }}" = "true" ]; then ARGS="$ARGS --always"; fi
           python kinetic_alert.py $ARGS
 
@@ -70,3 +81,12 @@ jobs:
         with:
           path: state.json
           key: kinetic-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # the script wrote next_until when this job ended at a phase end (or at the 350-minute cap before it);
+      # the new job waits in the queue until this one has finished, then carries on
+      - name: Start the next job
+        if: always() && steps.run.outputs.next_until != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow run kinetic.yml --ref "${{ github.ref_name }}" -f until_et="${{ steps.run.outputs.next_until }}" -f max_minutes=350
