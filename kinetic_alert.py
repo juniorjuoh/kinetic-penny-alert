@@ -387,6 +387,34 @@ def session_open():
     return t.weekday() < 5 and 4 <= t.hour < 20
 
 
+# A day is run as three back-to-back jobs.  Each job stops at one of these ET clock times and then starts the next one:
+#   pre-market job -> 09:20 ET (23:20 KST in winter) | regular-session job -> 14:30 ET (04:30 KST) | after-hours job -> 20:00 ET (10:00 KST)
+PHASE_ENDS = ["09:20", "14:30", "20:00"]
+UNTIL_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+
+
+def resolve_until(arg, now):
+    """--until-et value -> the 'HH:MM' (ET) this job stops at, or None.  'auto' = the first phase end after now."""
+    if not arg:
+        return None
+    if UNTIL_RE.match(arg):
+        return arg
+    cur = now.strftime("%H:%M")
+    return next((p for p in PHASE_ENDS if p > cur), None)
+
+
+def next_after(until):
+    return next((p for p in PHASE_ENDS if p > until), "")
+
+
+def chain_next(now, until):
+    """The 'until' the NEXT job should use, '' = nothing more today.
+    The job ended before its phase end (the 350-minute cap) -> carry on with the same phase; it reached the phase end -> next phase."""
+    if not until:
+        return ""
+    return until if now.strftime("%H:%M") < until else next_after(until)
+
+
 def seconds_to_open():
     """Seconds until today's 04:00 ET pre-market open on a weekday, or None if the open is not today."""
     t = datetime.now(ET)
@@ -867,6 +895,7 @@ def main():
     ap.add_argument("--always", action="store_true", help="run even outside 04:00-20:00 ET")
     ap.add_argument("--max-minutes", type=float, default=0, help="exit gracefully after N minutes (CI jobs)")
     ap.add_argument("--exit-when-closed", action="store_true", help="exit instead of sleeping when the market is closed (CI)")
+    ap.add_argument("--until-et", default=None, metavar="HH:MM|auto", help="stop at this ET clock time ('auto' = end of the current phase) and report the next phase")
     ap.add_argument("--check", metavar="SYM")
     ap.add_argument("--get-chat-id", action="store_true")
     ap.add_argument("--test-telegram", action="store_true")
@@ -881,7 +910,14 @@ def main():
 
     log(f"start: +{MIN_CHANGE:.0f}% / <${MAX_PRICE} / vol>={fmt_vol(MIN_VOLUME)} / forming_bar={USE_FORMING_BAR} / poll={POLL}s")
     deadline = time.time() + a.max_minutes * 60 if a.max_minutes else None
-    while deadline is None or time.time() < deadline:
+    until = resolve_until(a.until_et, datetime.now(ET))
+    if until:
+        log(f"this job stops at {until} ET")
+
+    def keep_running():
+        return (deadline is None or time.time() < deadline) and (until is None or datetime.now(ET).strftime("%H:%M") < until)
+
+    while keep_running():
         if a.always or a.once or session_open():
             state = load_state()
             try:
@@ -903,7 +939,12 @@ def main():
             nap = 300 if wait is None or wait > 300 else max(1, wait)
             log(f"market closed (04:00-20:00 ET, Mon-Fri) - sleeping {nap}s")
             time.sleep(nap)
-    log("max runtime reached - exiting for handoff")
+    nxt = chain_next(datetime.now(ET), until)
+    log(f"exiting for handoff (max runtime or phase end); next job's end time: {nxt or 'none'}")
+    out = os.environ.get("GITHUB_OUTPUT")          # the workflow reads this and starts the next job
+    if out and nxt:
+        with open(out, "a", encoding="utf-8") as f:
+            f.write(f"next_until={nxt}\n")
 
 
 if __name__ == "__main__":
