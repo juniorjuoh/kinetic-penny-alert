@@ -65,7 +65,7 @@ CUSTOM_ALERTS = env("CUSTOM_ALERTS", 1, int)      # tickers you type in Telegram
 CUSTOM_COOLDOWN_SEC = env("CUSTOM_COOLDOWN_SEC", 300, int)   # min seconds between two alerts for the same ticker
 CUSTOM_MAX = env("CUSTOM_MAX", 30, int)           # max tickers you can watch at once
 CUSTOM_MSG_MAX_AGE_SEC = env("CUSTOM_MSG_MAX_AGE_SEC", 10800, int)  # ignore chat messages older than this (3 h)
-PICK_ALERTS = env("PICK_ALERTS", 1, int)          # recommend stocks up >= PICK_MIN_CHANGE whose 3m and 10m Pivots are similar
+PICK_ALERTS = env("PICK_ALERTS", 0, int)          # recommend stocks up >= PICK_MIN_CHANGE whose 3m and 10m Pivots are similar
 PICK_MIN_CHANGE = env("PICK_MIN_CHANGE", 16.0, float)   # day % change for a recommendation candidate
 PICK_SIM_PCT = env("PICK_SIM_PCT", 0.5, float)    # "similar" = P and R1 of the 3m / 10m Pivots differ by at most this % of the price
 PICK_MAX = env("PICK_MAX", 40, int)               # max recommended stocks tracked per day
