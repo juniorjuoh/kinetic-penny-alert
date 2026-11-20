@@ -12,7 +12,7 @@ import os
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -536,26 +536,13 @@ def pdh_state(rows, lv, now):
     if (now - last[0]).total_seconds() > R2_MAX_AGE_SEC or last[0].date() != now.date():
         return None
     near_pct = abs(lv["P"] - lv["h"]) / lv["h"] * 100.0
-    b3, p3 = bars_nm(rows, 3), None                     # Pivot of the previous completed 3-minute bar (same as the R2 alert)
-    if len(b3) >= 2 and b3[-2]["c"] > 0 and b3[-1]["t"] - b3[-2]["t"] == timedelta(minutes=3):
-        pb = b3[-2]                                     # only if it is the slot right before the current one (illiquid stocks skip slots)
-        if (pb["h"] - pb["l"]) / pb["c"] * 100.0 >= R2_MIN_RANGE_PCT:   # a flat bar gives P = R1 = R2 = meaningless
-            p3 = {"t": pb["t"], **pivot_levels(pb["h"], pb["l"], pb["c"])}
     return {"price": last[4], "price_ts": last[0], "above": last[4] > lv["h"], "near_pct": near_pct,
-            "near": near_pct <= PDH_PIVOT_NEAR_PCT, "p3": p3}
+            "near": near_pct <= PDH_PIVOT_NEAR_PCT}
 
 
 def pdh_message(sym, info, lv, st):
-    chg = f"+{info['chg']:.1f}%" if info.get("chg") is not None else "-"
-    p3 = st.get("p3")
-    p3_line = (f"3분 Pivot <b>P {fmt_px(p3['P'])}</b> | <b>R1 {fmt_px(p3['R1'])}</b> | R2 {fmt_px(p3['R2'])}  (직전 3분봉 {p3['t']:%H:%M} 기준)\n"
-               if p3 else "")
-    return (f"📈 <b>{sym}</b> 전일고가 돌파 · 당일 {chg} · ${fmt_px(st['price'])}\n"
-            f"전일고가 <b>${fmt_px(lv['h'])}</b> ({lv['date']}) 위 · 마지막 체결 {st['price_ts']:%H:%M:%S} ET\n"
-            f"전일 Pivot <b>${fmt_px(lv['P'])}</b> (전일고가와 {st['near_pct']:.1f}% 차이)\n"
-            f"R1 {fmt_px(lv['R1'])} | R2 {fmt_px(lv['R2'])} | S1 {fmt_px(lv['S1'])}  (전일 고·저·종가 기준 계산값)\n"
-            f"{p3_line}"
-            f"{info.get('name', '')}\n{link(sym)}")
+    return (f"⭐🚨 <b>{sym}</b> 전일고가 돌파 (${fmt_px(lv['h'])}) Pivot (${fmt_px(lv['P'])})\n"
+            f"ENTRY R1 {fmt_px(lv['R1'])}")
 
 
 def check_pdh(state, movers_all):
