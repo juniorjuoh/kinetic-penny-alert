@@ -68,7 +68,7 @@ CUSTOM_MAX = env("CUSTOM_MAX", 30, int)           # max tickers you can watch at
 CUSTOM_MSG_MAX_AGE_SEC = env("CUSTOM_MSG_MAX_AGE_SEC", 10800, int)  # ignore chat messages older than this (3 h)
 PDH_ALERTS = env("PDH_ALERTS", 1, int)            # alert: up >= PDH_MIN_CHANGE, price above yesterday's high, yesterday's Pivot near that high
 PDH_MIN_CHANGE = env("PDH_MIN_CHANGE", 16.0, float)   # day % change for the candidate list
-PDH_PIVOT_NEAR_PCT = env("PDH_PIVOT_NEAR_PCT", 5.0, float)  # "near" = yesterday's Pivot is within this % of yesterday's high
+PDH_PIVOT_NEAR_PCT = env("PDH_PIVOT_NEAR_PCT", 10.0, float)  # "near" = yesterday's Pivot is within this % of yesterday's high
 MIN_AVG_VOL = env("MIN_AVG_VOL", 200_000, int)    # pre/post-market universe: 3-month avg volume floor
 MIN_EXT_VOLUME = env("MIN_EXT_VOLUME", 50_000, int)  # pre-market volume floor (only if Yahoo reports it)
 MIN_BARS = 60
